@@ -1,9 +1,12 @@
+#! /usr/bin/python
+
 from pyulog.core import ULog
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import axes3d
 import pandas as pd
 import numpy as np
 import sys
+import os
 
 def Plot_3D_trajectory(ax, df): 
 
@@ -48,11 +51,16 @@ def ISE(df):
         
 #open csv file and retrieve data
 if len(sys.argv) < 2:
-    print("ERROR: No input csv file")
-    exit(-1)
-csv_file = sys.argv[1]
+    print("WARNING: No input csv file specified, trying to use out.csv...")
+    csv_file = "./out.csv"
+else:
+    csv_file = sys.argv[1]
 
-#### Dataframe building and data preprocessing####
+if not os.path.isfile(csv_file):
+    print("ERROR: can't find " + csv_file)
+    exit(-1)
+
+#### Dataframe building and data preprocessing ####
 
 df = pd.read_csv(csv_file)
 
@@ -69,7 +77,7 @@ ise = ISE(df)
 #### Plotting ####
 
 #create figure with 3x3 grid
-fig = plt.figure(sys.argv[1] + " Analisys")
+fig = plt.figure(csv_file + " Analisys")
 gs = fig.add_gridspec(3,3)
 
 #3D plot of the trajectory
