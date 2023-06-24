@@ -12,27 +12,72 @@
 #include <mavsdk/plugins/mavlink_passthrough/mavlink_passthrough.h>
 #include <mavsdk/log_callback.h>
 #include <iostream>
-#include <future>
 #include <memory>
 #include <fstream>
 #include <queue>
 #include <thread>
 
+#define PI 3.14159265358979323846
+
 using namespace mavsdk;
 using std::this_thread::sleep_for;
+ 
+/* Helical trajectory parameters 
+ * The helix is a space curve with parametric equations (https://mathworld.wolfram.com/Helix.html):
+ *      x =	r*cos(t)	         
+ *      y =	r*sin(t)	 
+ *      z =	c*t 
+ * For t in [0, N_loops * 2*PI]
+ * Where r is the helix radius, and 2*PI*c is a constant giving the vertical separation of the helix's loops.
+ */
+constexpr float helix_origin[3] = {0.0f, 0.0f, -5.0f};            //!< origin of the helical path (NED frame)
+constexpr float helix_radius = 5.0f;                              //!< radius of the helical trajectory [m]
+constexpr float helix_start[3] = {helix_radius, 0.0f, -5.0f};     //!< starting point of the helical trajectory
+constexpr float vertical_separation = 2.0f;                       //!< vertical separation between loops in the helix [m]
+constexpr float c = vertical_separation / (2*PI);                 //!< c parameter of the helix
+constexpr unsigned int N_loops = 2;                               //!< number of loops in the helical trajectory
 
-// helical trajectory parameters
-float helix_origin[3] = {0.0f, 0.0f, -5.0f};            //!< origin of the helical path (NED frame)
-float helix_radius = 5.0f;                              //!< radius of the helical trajectory [m]
-float helix_start[3] = {helix_radius, 0.0f, -5.0f};     //!< starting point of the helical trajectory
-float vertical_separation = 1.0f;                       //!< vertical separation between loops in the helix [m]
-float trajectory_speed = 0.4f;                          //!< speed of the trajectory
+/* Trapezoidal velocity profile parameters
+ * 
+ *     max     |
+ *  trajectory |___________________________
+ *    speed    |           /|             |\                
+ *             |          / |             | \               A --> v(t) = max_trajectory_speed/t_acc * (t-t_i)
+ *             |         /  |             |  \                    q(t) = q_i + max_trajectory_speed/(2*t_acc) * (t-t_i)^2 
+ *             |        /   |             |   \             B --> v(t) = max_trajectory_speed
+ *             |       /    |             |    \                  q(t) = q_i + max_trajectory_speed * (t-t_i-t_acc/2)
+ *             |      /     |             |     \           C --> v(t) = max_trajectory_speed/t_dec * (t_f-t)
+ *             |     /  A   |      B      |  C   \                q(t) = q_f - max_trajectory_speed/(2*t_dec) * (t_f-t)^2 
+ *             |    /       |             |       \
+ *             |___/________|_____________|________\_____>t
+ *            0    |        |             |        |
+ *                t_i    t_i+t_acc     t_f-t_dec  t_f
+ * 
+ * We choose the maximum trajectory speed so, we have the following contraint on acceleration time (= deceleration time):
+ *      t_acc = t_dec = (max_trajectory_speed * T - h) / max_trajectory_speed
+ * where T = (t_f - t_i) is the duration of the entire trajectory, and h = (q_f - q_i) is the space covered by the trajectory.
+ * We need to satisfy the condition max_trajectory_speed >= h/T
+ * 
+ * In our case we describe a path for the parameter of the helical trajectory (parameter t in https://mathworld.wolfram.com/Helix.html),
+ * we have t_i = 0, q_i = 0
+ */
+constexpr double max_trajectory_speed = 0.4;                                          //!< maximum speed of the trajectory
+constexpr double t_i = 0.0;                                                           //!< trajectory starting instant [s]
+constexpr double t_f = 50.0;                                                          //!< trajectory ending instant [s]
+constexpr double T = t_f - t_i;                                                       //!< duration of the trajectory (t_f - t_i)
+constexpr double q_i = 0.0;                                                           //!< trajectory starting position
+constexpr double q_f = N_loops * 2*PI;                                                //!< trajectory ending position
+constexpr double h = q_f - q_i;                                                       //!< space covered by the trajectory (q_f - q_i)
+constexpr double t_acc = (max_trajectory_speed * T - h) / max_trajectory_speed;       //!< acceleration time [s]
+constexpr double t_dec = t_acc;                                                       //!< deceleration time [s]
+// check trajectory constraint
+static_assert(max_trajectory_speed >= h/T, "Cannot define a suitable trajectory with given parameters");
 
 // global variables
-uint64_t unix_epoch_time_us;                            //!< onboard unix time [us]
+uint64_t unix_epoch_time_us;                                                //!< onboard unix time [us]
 
 // ground station settings 
-bool logging = true;                                    //!< start/stop logging the position and position setpoint messages
+bool logging = true;                                                        //!< start/stop logging the position and position setpoint messages
 
 // message queues for logging
 std::queue<mavlink_position_target_local_ned_t> pos_stp_queue;
@@ -301,17 +346,42 @@ void offboard_goto(const Offboard::PositionNedYaw &target_pos, Offboard &offboar
  * 
  * @param[out] target_pos output position setpoint
  * @param[out] target_vel output velocity setpoint
- * @param trajectory_time time elapsed from the start of the helical motion [s]
+ * @param t time elapsed from the start of the helical motion [s] (t in [t_i, t_f])
  */
-void compute_helix_setpoint(Offboard::PositionNedYaw &target_pos, Offboard::VelocityNedYaw &target_vel, double trajectory_time)
-{
-    target_pos.north_m = helix_origin[0] + helix_radius * cosf(trajectory_time * trajectory_speed);
-    target_pos.east_m = helix_origin[1] + helix_radius * sinf(trajectory_time * trajectory_speed);
-    target_pos.down_m = helix_origin[2] - vertical_separation * trajectory_time * trajectory_speed; // NED frame
+void compute_helix_setpoint(Offboard::PositionNedYaw &target_pos, Offboard::VelocityNedYaw &target_vel, double t)
+{   
+    // compute trajectory with a trapezoidal profile speed
 
-    target_vel.north_m_s = -helix_radius * trajectory_speed * sinf(trajectory_time * trajectory_speed);
-    target_vel.east_m_s = helix_radius * trajectory_speed * cosf(trajectory_time * trajectory_speed);
-    target_vel.down_m_s = -vertical_separation * trajectory_speed; // NED frame
+    double q, q_dot;    // parameter t and its derivative wrt time
+    if (t >= t_i && t <= t_i + t_acc)   // acceleration phase
+    {
+        q = q_i + max_trajectory_speed/(2*t_acc) * pow((t-t_i),2);
+        q_dot = (max_trajectory_speed / t_acc) * t;
+    }
+    else if (t < t_f - t_dec) // constant velocity phase
+    {
+        q = q_i + max_trajectory_speed * (t-t_i-t_acc/2);
+        q_dot = max_trajectory_speed;
+    }
+    else if(t <= t_f) // deceleration phase
+    {
+        q = q_f - max_trajectory_speed/(2*t_dec) * pow((t_f-t),2);
+        q_dot = (max_trajectory_speed / t_dec) * (t_f - t);
+    }
+    else // outside [t_i, t_f]
+    {
+        q = q_f; 
+        q_dot = 0;
+    }
+
+    // compute position and velocity setpoints
+    target_pos.north_m = helix_origin[0] + helix_radius * cosf(q);
+    target_pos.east_m = helix_origin[1] + helix_radius * sinf(q);
+    target_pos.down_m = helix_origin[2] - c * q; // NED frame
+
+    target_vel.north_m_s = - helix_radius * q_dot * sinf(q);
+    target_vel.east_m_s = helix_radius * q_dot * cosf(q);
+    target_vel.down_m_s = - c * q_dot; // NED frame
 }
 
 /**
@@ -548,7 +618,7 @@ int main(int argc, char **argv)
 
     std::cout << "Performing helical trajectory" << std::endl;
     double trajectory_time = 0.0;
-    while (trajectory_time < 30.0)
+    while (trajectory_time <= t_f)
     {
         trajectory_time = (unix_epoch_time_us - start_unix_time_us) / 1e6;
 
