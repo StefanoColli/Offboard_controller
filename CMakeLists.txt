@@ -7,6 +7,8 @@ project(helical_trajectory)
 
 add_executable(helical_trajectory
     helical_trajectory.cpp
+    trajectory_generator.hpp
+    trajectory_generator.cpp
 )
 
 find_package(MAVSDK REQUIRED)

@@ -16,6 +16,7 @@
 #include <fstream>
 #include <queue>
 #include <thread>
+#include "trajectory_generator.hpp"
 
 #define PI 3.14159265358979323846
 
@@ -32,49 +33,18 @@ using std::this_thread::sleep_for;
  */
 constexpr float helix_origin[3] = {0.0f, 0.0f, -5.0f};            //!< origin of the helical path (NED frame)
 constexpr float helix_radius = 5.0f;                              //!< radius of the helical trajectory [m]
-constexpr float helix_start[3] = {helix_radius, 0.0f, -5.0f};     //!< starting point of the helical trajectory
+constexpr float helix_start[3] = {helix_radius, 0.0f, -5.0f};     //!< starting point of the helical trajectory (NED frame)
 constexpr float vertical_separation = 2.0f;                       //!< vertical separation between loops in the helix [m]
 constexpr float c = vertical_separation / (2*PI);                 //!< c parameter of the helix
 constexpr unsigned int N_loops = 2;                               //!< number of loops in the helical trajectory
-
-/* Trapezoidal velocity profile parameters
- * 
- *     max     |
- *  trajectory |___________________________
- *    speed    |           /|             |\                
- *             |          / |             | \               A --> v(t) = max_trajectory_speed/t_acc * (t-t_i)
- *             |         /  |             |  \                    q(t) = q_i + max_trajectory_speed/(2*t_acc) * (t-t_i)^2 
- *             |        /   |             |   \             B --> v(t) = max_trajectory_speed
- *             |       /    |             |    \                  q(t) = q_i + max_trajectory_speed * (t-t_i-t_acc/2)
- *             |      /     |             |     \           C --> v(t) = max_trajectory_speed/t_dec * (t_f-t)
- *             |     /  A   |      B      |  C   \                q(t) = q_f - max_trajectory_speed/(2*t_dec) * (t_f-t)^2 
- *             |    /       |             |       \
- *             |___/________|_____________|________\_____>t
- *            0    |        |             |        |
- *                t_i    t_i+t_acc     t_f-t_dec  t_f
- * 
- * We choose the maximum trajectory speed so, we have the following contraint on acceleration time (= deceleration time):
- *      t_acc = t_dec = (max_trajectory_speed * T - h) / max_trajectory_speed
- * where T = (t_f - t_i) is the duration of the entire trajectory, and h = (q_f - q_i) is the space covered by the trajectory.
- * We need to satisfy the condition max_trajectory_speed >= h/T
- * 
- * In our case we describe a path for the parameter of the helical trajectory (parameter t in https://mathworld.wolfram.com/Helix.html),
- * we have t_i = 0, q_i = 0
- */
-constexpr double max_trajectory_speed = 0.4;                                          //!< maximum speed of the trajectory
-constexpr double t_i = 0.0;                                                           //!< trajectory starting instant [s]
-constexpr double t_f = 50.0;                                                          //!< trajectory ending instant [s]
-constexpr double T = t_f - t_i;                                                       //!< duration of the trajectory (t_f - t_i)
-constexpr double q_i = 0.0;                                                           //!< trajectory starting position
-constexpr double q_f = N_loops * 2*PI;                                                //!< trajectory ending position
-constexpr double h = q_f - q_i;                                                       //!< space covered by the trajectory (q_f - q_i)
-constexpr double t_acc = (max_trajectory_speed * T - h) / max_trajectory_speed;       //!< acceleration time [s]
-constexpr double t_dec = t_acc;                                                       //!< deceleration time [s]
-// check trajectory constraint
-static_assert(max_trajectory_speed >= h/T, "Cannot define a suitable trajectory with given parameters");
+constexpr double max_trajectory_speed = 0.4;                      //!< maximum speed of the trajectory
+constexpr double helix_duration = 50.0;                           //!< helical trajectory duration [s]
 
 // global variables
 uint64_t unix_epoch_time_us;                                                //!< onboard unix time [us]
+
+// general settings
+constexpr float takeoff_height = 5.0;                                       //!< height after takeoff
 
 // ground station settings 
 bool logging = true;                                                        //!< start/stop logging the position and position setpoint messages
@@ -346,33 +316,14 @@ void offboard_goto(const Offboard::PositionNedYaw &target_pos, Offboard &offboar
  * 
  * @param[out] target_pos output position setpoint
  * @param[out] target_vel output velocity setpoint
+ * @param trajectory_gen TrajectoryGenerator instance used to smooth the trajectory
  * @param t time elapsed from the start of the helical motion [s] (t in [t_i, t_f])
  */
-void compute_helix_setpoint(Offboard::PositionNedYaw &target_pos, Offboard::VelocityNedYaw &target_vel, double t)
+void compute_helix_setpoint(Offboard::PositionNedYaw &target_pos, Offboard::VelocityNedYaw &target_vel, TrajectoryGenerator &trajectory_gen, double t)
 {   
     // compute trajectory with a trapezoidal profile speed
-
-    double q, q_dot;    // parameter t and its derivative wrt time
-    if (t >= t_i && t <= t_i + t_acc)   // acceleration phase
-    {
-        q = q_i + max_trajectory_speed/(2*t_acc) * pow((t-t_i),2);
-        q_dot = (max_trajectory_speed / t_acc) * t;
-    }
-    else if (t < t_f - t_dec) // constant velocity phase
-    {
-        q = q_i + max_trajectory_speed * (t-t_i-t_acc/2);
-        q_dot = max_trajectory_speed;
-    }
-    else if(t <= t_f) // deceleration phase
-    {
-        q = q_f - max_trajectory_speed/(2*t_dec) * pow((t_f-t),2);
-        q_dot = (max_trajectory_speed / t_dec) * (t_f - t);
-    }
-    else // outside [t_i, t_f]
-    {
-        q = q_f; 
-        q_dot = 0;
-    }
+    double q = trajectory_gen.compute_trajectory_position(t);
+    double q_dot = trajectory_gen.compute_trajectory_velocity(t); 
 
     // compute position and velocity setpoints
     target_pos.north_m = helix_origin[0] + helix_radius * cosf(q);
@@ -598,19 +549,23 @@ int main(int argc, char **argv)
     // Arm vehicle
     arm(action, telemetry);
     // Take off
-    takeoff(5.0, action, telemetry);
+    takeoff(takeoff_height, action, telemetry);
 
-    // helical trajectory
+    // offboard phase
     start_offboard_mode(offboard);
 
     // reach starting position
     std::cout << "Approaching starting position" << std::endl;
-    Offboard::PositionNedYaw starting_pos{helix_start[0], helix_start[1], helix_start[2], 0.0f};
-    offboard_goto(starting_pos, offboard, telemetry);
+    Offboard::PositionNedYaw target_position{helix_start[0], helix_start[1], helix_start[2], 0.0f};
+    offboard_goto(target_position, offboard, telemetry);
 
     uint64_t start_unix_time_us = unix_epoch_time_us;
     Offboard::PositionNedYaw pos_stp;
     Offboard::VelocityNedYaw vel_stp;
+
+    // We describe a path for the parameter of the helical trajectory (parameter t in https://mathworld.wolfram.com/Helix.html)
+    //  having a trapezoidal velocity profile
+    TrapezoidalVelocityProfile trapezoidal_trajectory = TrapezoidalVelocityProfile(0.0, helix_duration, 0.0, N_loops*2*PI, max_trajectory_speed);
 
     // start threads to log incoming messages
     std::thread thread_pos(subscribe_function, MAVLINK_MSG_ID_LOCAL_POSITION_NED, position_callback, std::ref(mavlinkpassthrough));
@@ -618,11 +573,11 @@ int main(int argc, char **argv)
 
     std::cout << "Performing helical trajectory" << std::endl;
     double trajectory_time = 0.0;
-    while (trajectory_time <= t_f)
+    while (trajectory_time <= helix_duration)
     {
         trajectory_time = (unix_epoch_time_us - start_unix_time_us) / 1e6;
 
-        compute_helix_setpoint(pos_stp, vel_stp, trajectory_time);
+        compute_helix_setpoint(pos_stp, vel_stp, trapezoidal_trajectory,  trajectory_time);
         offboard.set_position_velocity_ned(pos_stp, vel_stp);
 
         sleep_for(std::chrono::milliseconds(20)); // send setpoints at 50Hz
