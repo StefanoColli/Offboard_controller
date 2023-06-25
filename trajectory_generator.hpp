@@ -91,4 +91,57 @@ public:
 };
 
 
+/*
+ * Polynomial trajectory with grade 3 poly:
+ * q(t) = a_0 + a_1*(t-t_i) + a_2*(t-t_i)^2 + a_3*(t-t_i)^3
+ * q_dot(t) = a_1 + 2*a_2*(t-t_i) + 3*a_3*(t-t_i)^2
+ * where: 
+ *  - T = t_f - t_i
+ *  - a_0 = q_i
+ *  - a_1 = q_i_dot
+ *  - a_2 = [-3*(q_i - q_f) - (2*q_i_dot + q_f_dot)*T]/T^2
+ *  - a_3 = [2*(q_i - q_f) + (q_i_dot + q_f_dot)*T]/T^3
+*/
+class CubicTrajectory : public TrajectoryGenerator
+{
+private:    
+    double q_i_dot;                 //!< initial velocity
+    double q_f_dot;                 //!< final velocity
+    double T;                       //!< total trajectory duration [s]
+    double a_0, a_1, a_2, a_3;      //!< poly coefficients
+public:
+    CubicTrajectory(const CubicTrajectory&) = delete;                 //disable copy-constructor
+    CubicTrajectory& operator=(const CubicTrajectory&) = delete;      //disable copy-assignment
+
+    /**
+     * @brief Construct a new Cubic Trajectory object
+     * 
+     * @param starting_time trajectory starting instant
+     * @param ending_time trajectory ending instant
+     * @param starting_pos trajectory starting position 
+     * @param final_pos trajectory final position (target position)
+     * @param starting_vel trajectory initial velocity
+     * @param final_vel trajectory final velocity
+     */
+    CubicTrajectory(double starting_time, double ending_time, double starting_pos, double final_pos,
+                         double starting_vel, double final_vel);
+    ~CubicTrajectory() = default;
+
+    /**
+     * @brief Compute position along trajectory at a given time instant
+     * 
+     * @param t time instant
+     * @return double position
+     */
+    double compute_trajectory_position(double t);
+
+    /**
+     * @brief Compute velocity along trajectory at a given time instant
+     * 
+     * @param t time instant
+     * @return double velocity
+     */
+    double compute_trajectory_velocity(double t); 
+};
+
 

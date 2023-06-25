@@ -292,21 +292,41 @@ bool estimated_position_close_to(const Offboard::PositionNedYaw &target_pos, flo
  * @brief Steer drone to target position and wait until it is in the neighborhood of the destination
  *  
  * @param target_pos desired target position
+ * @param duration time allowed to the drone to reach target position [s]
  * @param offboard Offboard plugin instance
  * @param telemetry Telemetry plugin instance
  */
-void offboard_goto(const Offboard::PositionNedYaw &target_pos, Offboard &offboard, Telemetry &telemetry)
+void offboard_goto(const Offboard::PositionNedYaw &target_pos, double duration, Offboard &offboard, Telemetry &telemetry)
 {
-    // TODO approach with a certain velocity
-    // TODO smoothly reach the target (copy from px4?)
-    offboard.set_position_ned(target_pos);
-    if (offboard.start() != Offboard::Result::Success)
+    Telemetry::PositionNed current_pos = telemetry.position_velocity_ned().position;
+    
+    // use 3rd grade poly to have a smooth trajectory from current position to the target position
+    CubicTrajectory north_trajectory = CubicTrajectory(0.0, duration, current_pos.north_m, target_pos.north_m, 0.0, 0.0);   
+    CubicTrajectory east_trajectory = CubicTrajectory(0.0, duration, current_pos.east_m, target_pos.east_m, 0.0, 0.0);
+    CubicTrajectory down_trajectory = CubicTrajectory(0.0, duration, current_pos.down_m, target_pos.down_m, 0.0, 0.0);
+
+    Offboard::PositionNedYaw setpoint;
+    uint64_t trajectory_start_unix_us = unix_epoch_time_us;
+    double elapsed_time = 0.0;
+    while (elapsed_time <= duration)
     {
-        std::cerr << "Cannot start setpoint positioning" << std::endl;
+        // update time
+        elapsed_time = (unix_epoch_time_us - trajectory_start_unix_us) / 1e6;
+
+        // compute setpoint
+        setpoint.north_m = north_trajectory.compute_trajectory_position(elapsed_time);
+        setpoint.east_m = east_trajectory.compute_trajectory_position(elapsed_time);
+        setpoint.down_m = down_trajectory.compute_trajectory_position(elapsed_time);
+        setpoint.yaw_deg = target_pos.yaw_deg; //not interested in smoothing yaw
+        
+        // send setpoint to the drone
+        offboard.set_position_ned(setpoint);
     }
+
+    // check if we reached target position, if not wait until it is reached
     while (!estimated_position_close_to(target_pos, 0.1f, telemetry))
     {
-        sleep_for(std::chrono::milliseconds(500));
+        sleep_for(std::chrono::milliseconds(100));
     }
     std::cout << "Target reached" << std::endl;
 }
@@ -557,7 +577,7 @@ int main(int argc, char **argv)
     // reach starting position
     std::cout << "Approaching starting position" << std::endl;
     Offboard::PositionNedYaw target_position{helix_start[0], helix_start[1], helix_start[2], 0.0f};
-    offboard_goto(target_position, offboard, telemetry);
+    offboard_goto(target_position, 10.0, offboard, telemetry);
 
     uint64_t start_unix_time_us = unix_epoch_time_us;
     Offboard::PositionNedYaw pos_stp;

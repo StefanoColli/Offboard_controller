@@ -65,3 +65,29 @@ double TrapezoidalVelocityProfile::compute_trajectory_velocity(double t)
         return 0.0;
     }
 }
+
+CubicTrajectory::CubicTrajectory(double starting_time, double ending_time, double starting_pos, double final_pos,
+                         double starting_vel, double final_vel)
+{
+    t_i = starting_time;
+    t_f = ending_time;
+    q_i = starting_pos;
+    q_f = final_pos; 
+    q_i_dot = starting_vel;
+    q_f_dot = final_vel;
+    T = t_f - t_i;
+    a_0 = q_i;
+    a_1 = q_i_dot;
+    a_2 = (-3*(q_i - q_f) - (2*q_i_dot + q_f_dot)*T)/pow(T,2);
+    a_3 = (2*(q_i - q_f) + (q_i_dot + q_f_dot)*T)/pow(T,3);
+}
+
+double CubicTrajectory::compute_trajectory_position(double t)
+{
+    return a_0 + a_1*(t-t_i) + a_2*pow((t-t_i),2) + a_3*pow((t-t_i),3);
+}
+
+double CubicTrajectory::compute_trajectory_velocity(double t)
+{
+    return a_1 + 2*a_2*(t-t_i) + 3*a_3*pow((t-t_i),2);
+}
