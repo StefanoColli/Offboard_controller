@@ -7,6 +7,8 @@
 #include <mavsdk/mavsdk.h>
 #include <mavsdk/plugins/action/action.h>
 #include <mavsdk/plugins/telemetry/telemetry.h>
+#include <mavsdk/plugins/param/param.h>
+#include <mavsdk/plugins/info/info.h>
 #include <mavsdk/plugins/offboard/offboard.h>
 #include <mavsdk/plugins/log_files/log_files.h>
 #include <mavsdk/plugins/mavlink_passthrough/mavlink_passthrough.h>
@@ -78,9 +80,22 @@ auto connect_to_system(Mavsdk &mavsdk, const std::string& url)
 
     for (auto system : mavsdk.systems())
     {
+        Info info = Info{system};
+        // wait for system information to be retrieved
+        while (info.get_identification().first==Info::Result::InformationNotReceivedYet) 
+        {
+            sleep_for(std::chrono::milliseconds(300));
+        }
+
+        // Get the system Version struct
+        const Info::Version &system_version =  info.get_version().second;
+
         std::cout << "Found system with MAVLink system ID: " << static_cast<int>(system->get_system_id())
-                  << ", connected: " << (system->is_connected() ? "yes" : "no")
-                  << ", has autopilot: " << (system->has_autopilot() ? "yes" : "no") << std::endl;
+                  << "\n\tFirmware version: " << system_version.flight_sw_major << "." << system_version.flight_sw_minor
+                  << "." << system_version.flight_sw_patch << "-" << system_version.flight_sw_vendor_major << "." 
+                  << system_version.flight_sw_vendor_minor << "." << system_version.flight_sw_vendor_patch
+                  << "\n\tConnected: " << (system->is_connected() ? "yes" : "no")
+                  << "\n\tHas autopilot: " << (system->has_autopilot() ? "yes" : "no") << std::endl;
     }
 
     auto system = mavsdk.systems()[0];
@@ -140,6 +155,34 @@ void preflight_check(Telemetry &telemetry)
             std::cerr << "  - Home position to be set." << std::endl;
         }
         sleep_for(std::chrono::seconds(1));
+    }
+}
+
+/**
+ * @brief Set the drone parameters needed to perform a simulation (DO NOT USE THIS FUNCTION WHEN FLYING REAL HW)
+ * 
+ * @param param Param plugin instance
+ */
+void set_simulation_parameters(Param &param)
+{
+    std::cout << "Setting all parameters necessary for simulation" << std::endl;
+
+    // ignore RC loss in any flight mode so to avoid triggering failsafe
+    if (param.set_param_int("COM_RCL_EXCEPT", 7) != Param::Result::Success) 
+    {
+        std::cerr << "Unable to set COM_RCL_EXCEPT parameter" << std::endl; 
+    }
+    
+    // disable joystick control, RC input handling and relative checks
+    if ( param.set_param_int("COM_RC_IN_MODE", 4) != Param::Result::Success) 
+    {
+        std::cerr << "Unable to set COM_RC_IN_MODE parameter" << std::endl; 
+    }
+
+    // do nothing on data link loss
+    if (param.set_param_int("NAV_DLL_ACT", 0) != Param::Result::Success) 
+    {
+        std::cerr << "Unable to set NAV_DLL_ACT parameter" << std::endl; 
     }
 }
 
@@ -551,6 +594,7 @@ int main(int argc, char **argv)
     Action action = Action{system};
     Offboard offboard = Offboard{system};
     LogFiles logfiles = LogFiles{system};
+    Param param = Param{system};
     MavlinkPassthrough mavlinkpassthrough = MavlinkPassthrough{system}; // to access the undelying mavlink protocol
 
     // Time subscription
@@ -561,6 +605,7 @@ int main(int argc, char **argv)
     // mavlinkpassthrough.subscribe_message_async(MAVLINK_MSG_ID_POSITION_TARGET_LOCAL_NED, setpoint_callback);
     // mavlinkpassthrough.subscribe_message_async(MAVLINK_MSG_ID_LOCAL_POSITION_NED, position_callback);
 
+    set_simulation_parameters(param);
 
     /////////////////////////////////////////////////
     /// FLIGHT
@@ -607,10 +652,6 @@ int main(int argc, char **argv)
 
     land_and_disarm(action, telemetry);
 
-    //disconnect from drone and free resources
-    mavsdk.~Mavsdk();
-
-
     /////////////////////////////////////////////////
     /// POST FLIGHT
     /////////////////////////////////////////////////
@@ -621,6 +662,9 @@ int main(int argc, char **argv)
 
     // if needed we can download the entire log file from the drone
     //download_ulg("./", logfiles);
+
+     //disconnect from drone and free resources
+    mavsdk.~Mavsdk();
 
     // save logs to csv file
     log_to_csv();
