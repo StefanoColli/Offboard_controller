@@ -13,11 +13,13 @@
 #include <mavsdk/plugins/log_files/log_files.h>
 #include <mavsdk/plugins/mavlink_passthrough/mavlink_passthrough.h>
 #include <mavsdk/log_callback.h>
+#include <mavsdk/mavlink/custom_messages/mavlink.h>
 #include <iostream>
 #include <memory>
 #include <fstream>
 #include <queue>
 #include <thread>
+#include <string>
 #include "trajectory_generator.hpp"
 
 #define PI 3.14159265358979323846
@@ -43,13 +45,11 @@ constexpr double max_trajectory_speed = 0.4;                      //!< maximum s
 constexpr double helix_duration = 50.0;                           //!< helical trajectory duration [s]
 
 // global variables
-uint64_t unix_epoch_time_us;                                                //!< onboard unix time [us]
-
-// general settings
-constexpr float takeoff_height = 5.0;                                       //!< height after takeoff
+uint64_t unix_epoch_time_us;                                       //!< onboard unix time [us]
+bool is_offboard = false;                                          //!< offboard flag
 
 // ground station settings 
-bool logging = true;                                                        //!< start/stop logging the position and position setpoint messages
+bool logging = true;                                               //!< start/stop logging the position and position setpoint messages
 
 // message queues for logging
 std::queue<mavlink_position_target_local_ned_t> pos_stp_queue;
@@ -134,6 +134,7 @@ void preflight_check(Telemetry &telemetry)
     }
     if (calibration_required)
     {
+        std::cout << "WARNING: Instrumentation calibration is required" << std::endl;
         // exit(1);
     }
 
@@ -174,7 +175,7 @@ void set_simulation_parameters(Param &param)
     }
     
     // disable joystick control, RC input handling and relative checks
-    if ( param.set_param_int("COM_RC_IN_MODE", 4) != Param::Result::Success) 
+    if (param.set_param_int("COM_RC_IN_MODE", 4) != Param::Result::Success) 
     {
         std::cerr << "Unable to set COM_RC_IN_MODE parameter" << std::endl; 
     }
@@ -184,6 +185,23 @@ void set_simulation_parameters(Param &param)
     {
         std::cerr << "Unable to set NAV_DLL_ACT parameter" << std::endl; 
     }
+}
+
+/**
+ * @brief Switch control method to be applied to control the drone 
+ * 
+ * @param mode desired control mode (0 -> PID, 1 -> HOSM)
+ * @param mavlinkpassthrough MavlinkPassthrough plugin instance
+ */
+void switch_control_mode(uint8_t mode, MavlinkPassthrough &mavlinkpassthrough)
+{
+    mavlink_message_t message;
+    mavlink_msg_control_type_pack(
+        mavlinkpassthrough.get_our_sysid(),
+        mavlinkpassthrough.get_our_compid(),
+        &message,
+        mode);
+    mavlinkpassthrough.send_message(message);
 }
 
 /**
@@ -238,7 +256,7 @@ void takeoff(float height, Action &action, Telemetry &telemetry)
         sleep_for(std::chrono::seconds(1));
     }
     // Reached target altitude
-    std::cout << "Takeoff Completed" << std::endl;
+    std::cout << "Takeoff completed" << std::endl;
 }
 
 /**
@@ -398,14 +416,14 @@ void compute_helix_setpoint(Offboard::PositionNedYaw &target_pos, Offboard::Velo
     target_vel.down_m_s = - c * q_dot; // NED frame
 }
 
-/**
+/** //TODO use download async
  * @brief Download the log file (.ulg) from the drone and delete it from the onboard memory afterwards 
  * (assuming there exists a single log file on the drone. If there are more files, the function does nothing and the 
  * desired operation has to be carried out manually)
  * 
  * @param dest_path path where to store the log file 
  * @param logfiles LogFiles plugin instance
- */
+ 
 void download_ulg(std::string dest_path ,LogFiles &logfiles)
 {
     std::cout << "Downloading log file..." << std::endl;
@@ -447,6 +465,7 @@ void download_ulg(std::string dest_path ,LogFiles &logfiles)
         std::cerr << "Cannot find any log file onboard" << std::endl;
     }
 }
+*/
 
 /**
  * @brief Saves data logged by the control station to output file in csv format
@@ -459,8 +478,8 @@ void log_to_csv(std::string filename = "out.csv")
     csv_file.open(filename);
     csv_file << "pos_t,pos_x,pos_y,pos_z,stp_t,stp_x,stp_y,stp_z\n";
 
-    int shortest_queue = pos_queue.size() < pos_stp_queue.size()? pos_queue.size() : pos_stp_queue.size(); 
-    while (shortest_queue)
+    int shortest_queue_size = pos_queue.size() < pos_stp_queue.size()? pos_queue.size() : pos_stp_queue.size(); 
+    while (shortest_queue_size)
     {
         mavlink_local_position_ned_t& pos = pos_queue.front();
         mavlink_position_target_local_ned_t& stp = pos_stp_queue.front();
@@ -470,7 +489,7 @@ void log_to_csv(std::string filename = "out.csv")
 
         pos_queue.pop();
         pos_stp_queue.pop();
-        shortest_queue --;
+        shortest_queue_size --;
     }
     csv_file.close();
 
@@ -558,15 +577,15 @@ void position_callback(const mavlink_message_t &msg)
 void subscribe_function(uint message_id, std::function<void (const mavlink_message_t &)> callback, MavlinkPassthrough &mavlinkpassthrough)
 {
     // subscribe to requested topic at 50Hz
-    mavlinkpassthrough.subscribe_message_async(message_id, callback);
+    MavlinkPassthrough::MessageHandle handle = mavlinkpassthrough.subscribe_message(message_id, callback);
     set_message_rate(message_id, 50.f, mavlinkpassthrough);   
-
+    
     while (logging)
     {
     }
 
     // unsubscribe from topics
-    mavlinkpassthrough.subscribe_message_async(message_id, nullptr);
+    mavlinkpassthrough.unsubscribe_message(handle);
 }
 
 int main(int argc, char **argv)
@@ -586,7 +605,15 @@ int main(int argc, char **argv)
 
     Mavsdk mavsdk;
 
-    mavsdk::log::subscribe(nullptr); // avoid mavsdk print debug messages to console
+    mavsdk::log::subscribe([](mavsdk::log::Level level,   // message severity level
+                          const std::string& message, // message text
+                          const std::string& file,    // source file from which the message was sent
+                          int line) {                 // line number in the source file
+
+        // returning true from the callback disables printing the message to stdout
+        return level < mavsdk::log::Level::Err; // print errors only
+    });
+
     auto system = connect_to_system(mavsdk, system_url);
 
     // Instantiate plugins
@@ -599,75 +626,211 @@ int main(int argc, char **argv)
 
     // Time subscription
     telemetry.set_rate_unix_epoch_time(50.0);
-    telemetry.subscribe_unix_epoch_time(time_callback);
-
-    // subscribe to mavlink topics
-    // mavlinkpassthrough.subscribe_message_async(MAVLINK_MSG_ID_POSITION_TARGET_LOCAL_NED, setpoint_callback);
-    // mavlinkpassthrough.subscribe_message_async(MAVLINK_MSG_ID_LOCAL_POSITION_NED, position_callback);
-
-    set_simulation_parameters(param);
-
-    /////////////////////////////////////////////////
-    /// FLIGHT
-    /////////////////////////////////////////////////
-    preflight_check(telemetry);
-    // Arm vehicle
-    arm(action, telemetry);
-    // Take off
-    takeoff(takeoff_height, action, telemetry);
-
-    // offboard phase
-    start_offboard_mode(offboard);
-
-    // reach starting position
-    std::cout << "Approaching starting position" << std::endl;
-    Offboard::PositionNedYaw target_position{helix_start[0], helix_start[1], helix_start[2], 0.0f};
-    offboard_goto(target_position, 10.0, offboard, telemetry);
-
-    uint64_t start_unix_time_us = unix_epoch_time_us;
-    Offboard::PositionNedYaw pos_stp;
-    Offboard::VelocityNedYaw vel_stp;
-
-    // We describe a path for the parameter of the helical trajectory (parameter t in https://mathworld.wolfram.com/Helix.html)
-    //  having a trapezoidal velocity profile
-    TrapezoidalVelocityProfile trapezoidal_trajectory = TrapezoidalVelocityProfile(0.0, helix_duration, 0.0, N_loops*2*PI, max_trajectory_speed);
-
-    // start threads to log incoming messages
-    std::thread thread_pos(subscribe_function, MAVLINK_MSG_ID_LOCAL_POSITION_NED, position_callback, std::ref(mavlinkpassthrough));
-    std::thread thread_pos_stp(subscribe_function, MAVLINK_MSG_ID_POSITION_TARGET_LOCAL_NED, setpoint_callback, std::ref(mavlinkpassthrough));
-
-    std::cout << "Performing helical trajectory" << std::endl;
-    double trajectory_time = 0.0;
-    while (trajectory_time <= helix_duration)
-    {
-        trajectory_time = (unix_epoch_time_us - start_unix_time_us) / 1e6;
-
-        compute_helix_setpoint(pos_stp, vel_stp, trapezoidal_trajectory,  trajectory_time);
-        offboard.set_position_velocity_ned(pos_stp, vel_stp);
-
-        sleep_for(std::chrono::milliseconds(20)); // send setpoints at 50Hz
-    }
-    stop_offboard_mode(offboard);
-    logging = false;
-
-    land_and_disarm(action, telemetry);
-
-    /////////////////////////////////////////////////
-    /// POST FLIGHT
-    /////////////////////////////////////////////////
+    Telemetry::UnixEpochTimeHandle unix_time_handle = telemetry.subscribe_unix_epoch_time(time_callback);
     
-    // join logging threads
-    thread_pos.join();
-    thread_pos_stp.join();
+    /////////////////////////////////////////////////
+    /// COMMANDER LOOP
+    /////////////////////////////////////////////////
 
-    // if needed we can download the entire log file from the drone
-    //download_ulg("./", logfiles);
+    std::string command_line;
+    while(std::cout << "gcs> " << std::flush && std::getline(std::cin, command_line))
+    {
+        size_t command_index = command_line.find(" ");
+        std::string cmd = command_line.substr(0, command_index);
+        
+        if (cmd == "simulation")
+        {
+            std::wcerr << "Warning! Use this command only in simulated environments" << std::endl;
+            set_simulation_parameters(param);               
+        }
+        else if (cmd == "help" || cmd == "h")
+        {
+            std::cout << "Available commands:\n"
+                      << " - \'arm\' to perform preflight check then arm the drone;\n"
+                      << " - \'auto\' to perform the entire simulation;\n"
+                      << " - \'close\' to terminate the ground control application;\n"
+                      << " - \'csv\' to store the logged data as csv file;\n"
+                      << " - \'goto\' to reach target position;\n"
+                      << " - \'helix\' to perform a helical ascending trajectory;\n"
+                      << " - \'help\' to list all available commands;\n"
+                      << " - \'land\' to land and disarm the drone;\n"
+                      << " - \'offmode\' to toggle offboard mode;\n"
+                      << " - \'simulation\' to set the PX4 parameters to perform a simulated flight (disable failsafe);\n"
+                      << " - \'takeoff\' to takeoff to the desired height;\n"
+                      << " - \'ulg\' to download the ulg log from the drone;\n"
+                      << std::endl;
+        }
+        else if (cmd == "close")
+        {
+            break;               
+        }
+        else if (cmd == "arm")
+        {
+            preflight_check(telemetry);
+            // Arm vehicle
+            arm(action, telemetry);               
+        }
+        else if (cmd == "takeoff")
+        {
+            std::cout << "Desired takeoff height? " << std::flush;
 
-     //disconnect from drone and free resources
-    mavsdk.~Mavsdk();
+            float takeoff_height;
+            std::cin >> takeoff_height;
+            std::cin.ignore();
 
-    // save logs to csv file
-    log_to_csv();
+            takeoff(takeoff_height, action, telemetry);  
+        }
+        else if (cmd == "land")
+        {
+            land_and_disarm(action, telemetry);
+        }
+        else if (cmd == "ulg")
+        {
+            // if needed we can download the entire log file from the drone
+            //download_ulg("./", logfiles);
+        }
+        else if (cmd == "csv")
+        {
+            std::cout << "Output filename? " << std::flush;
+
+            std::string filename;
+            std::cin >> filename;
+            std::cin.ignore();
+            // save logs to csv file
+            log_to_csv(filename + ".csv");
+        }
+        else if (cmd == "offmode")
+        {
+            if(!is_offboard)
+            {
+                start_offboard_mode(offboard);
+                is_offboard = true;
+            }
+            else
+            {
+                stop_offboard_mode(offboard);
+                is_offboard = false;
+            }
+        }
+        else if (cmd == "goto")
+        {
+            if (!is_offboard)
+            {
+                std::cout << "Drone is NOT in offboard mode" << std::endl;
+            }
+            else
+            {
+                float x,y,z;
+                std::cout << "Target position (x y z) [m]? " << std::flush;
+                std::cin >> x >> y >> z;   
+                std::cin.ignore();
+
+                std::cout << "Approaching target..." << std::endl;
+
+                Offboard::PositionNedYaw target_position{x, y, -z, 0.0f};
+                offboard_goto(target_position, 10.0, offboard, telemetry);
+            }
+        }
+        else if (cmd == "helix")
+        {
+            if (!is_offboard)
+            {
+                std::cout << "Drone is NOT in offboard mode" << std::endl;
+            }
+            else
+            {
+                uint64_t start_unix_time_us = unix_epoch_time_us;
+                Offboard::PositionNedYaw pos_stp;
+                Offboard::VelocityNedYaw vel_stp;
+
+                // We describe a path for the parameter of the helical trajectory (parameter t in https://mathworld.wolfram.com/Helix.html)
+                //  having a trapezoidal velocity profile
+                TrapezoidalVelocityProfile trapezoidal_trajectory = TrapezoidalVelocityProfile(0.0, helix_duration, 0.0, N_loops*2*PI, max_trajectory_speed);
+
+                // start threads to log incoming messages
+                std::thread thread_pos(subscribe_function, MAVLINK_MSG_ID_LOCAL_POSITION_NED, position_callback, std::ref(mavlinkpassthrough));
+                std::thread thread_pos_stp(subscribe_function, MAVLINK_MSG_ID_POSITION_TARGET_LOCAL_NED, setpoint_callback, std::ref(mavlinkpassthrough));
+
+                std::cout << "Performing helical trajectory" << std::endl;
+                double trajectory_time = 0.0;
+                while (trajectory_time <= helix_duration)
+                {
+                    trajectory_time = (unix_epoch_time_us - start_unix_time_us) / 1e6;
+
+                    compute_helix_setpoint(pos_stp, vel_stp, trapezoidal_trajectory,  trajectory_time);
+                    offboard.set_position_velocity_ned(pos_stp, vel_stp);
+
+                    sleep_for(std::chrono::milliseconds(20)); // send setpoints at 50Hz
+                }
+
+                logging = false;
+
+                // join logging threads
+                thread_pos.join();
+                thread_pos_stp.join();
+            }
+
+        }
+        else if (cmd == "auto")
+        {
+            set_simulation_parameters(param);
+
+            preflight_check(telemetry);
+            // Arm vehicle
+            arm(action, telemetry);
+            // Take off
+            takeoff(5.0f, action, telemetry);
+
+            // offboard phase
+            start_offboard_mode(offboard);
+
+            // reach starting position
+            std::cout << "Approaching starting position" << std::endl;
+            Offboard::PositionNedYaw target_position{helix_start[0], helix_start[1], helix_start[2], 0.0f};
+            offboard_goto(target_position, 10.0, offboard, telemetry);
+
+            uint64_t start_unix_time_us = unix_epoch_time_us;
+            Offboard::PositionNedYaw pos_stp;
+            Offboard::VelocityNedYaw vel_stp;
+
+            // We describe a path for the parameter of the helical trajectory (parameter t in https://mathworld.wolfram.com/Helix.html)
+            //  having a trapezoidal velocity profile
+            TrapezoidalVelocityProfile trapezoidal_trajectory = TrapezoidalVelocityProfile(0.0, helix_duration, 0.0, N_loops*2*PI, max_trajectory_speed);
+
+            // start threads to log incoming messages
+            std::thread thread_pos(subscribe_function, MAVLINK_MSG_ID_LOCAL_POSITION_NED, position_callback, std::ref(mavlinkpassthrough));
+            std::thread thread_pos_stp(subscribe_function, MAVLINK_MSG_ID_POSITION_TARGET_LOCAL_NED, setpoint_callback, std::ref(mavlinkpassthrough));
+
+            std::cout << "Performing helical trajectory" << std::endl;
+            double trajectory_time = 0.0;
+            while (trajectory_time <= helix_duration)
+            {
+                trajectory_time = (unix_epoch_time_us - start_unix_time_us) / 1e6;
+
+                compute_helix_setpoint(pos_stp, vel_stp, trapezoidal_trajectory,  trajectory_time);
+                offboard.set_position_velocity_ned(pos_stp, vel_stp);
+
+                sleep_for(std::chrono::milliseconds(20)); // send setpoints at 50Hz
+            }
+            stop_offboard_mode(offboard);
+            logging = false;
+
+            land_and_disarm(action, telemetry);
+
+            // join logging threads
+            thread_pos.join();
+            thread_pos_stp.join();
+
+            // save logs to csv file
+            log_to_csv();
+
+        }
+        else
+        {
+            std::cout << "Unrecognized command, type \'help\' to get the list of available commands" << std::endl;
+        }
+
+    }
 
     return 0;
 }
