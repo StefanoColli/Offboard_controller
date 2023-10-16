@@ -23,6 +23,22 @@ public:
      * @return double velocity
      */
     virtual double compute_trajectory_velocity(double t) = 0;
+
+    /**
+     * @brief Compute acceleration along trajectory at a given time instant
+     * 
+     * @param t time instant
+     * @return double acceleration
+     */
+    virtual double compute_trajectory_acceleration(double t) = 0;
+
+    /**
+     * @brief Compute jerk along trajectory at a given time instant
+     * 
+     * @param t time instant
+     * @return double jerk
+     */
+    virtual double compute_trajectory_jerk(double t) = 0;
 };
 
 
@@ -88,6 +104,22 @@ public:
      * @return double velocity
      */
     double compute_trajectory_velocity(double t); 
+
+    /**
+     * @brief Compute acceleration along trajectory at a given time instant
+     * 
+     * @param t time instant
+     * @return double acceleration
+     */
+    double compute_trajectory_acceleration(double t);
+
+    /**
+     * @brief Compute jerk along trajectory at a given time instant
+     * 
+     * @param t time instant
+     * @return double jerk
+     */
+    double compute_trajectory_jerk(double t);
 };
 
 
@@ -142,6 +174,22 @@ public:
      * @return double velocity
      */
     double compute_trajectory_velocity(double t); 
+    
+    /**
+     * @brief Compute acceleration along trajectory at a given time instant
+     * 
+     * @param t time instant
+     * @return double acceleration
+     */
+    double compute_trajectory_acceleration(double t);
+
+    /**
+     * @brief Compute jerk along trajectory at a given time instant
+     * 
+     * @param t time instant
+     * @return double jerk
+     */
+    double compute_trajectory_jerk(double t);
 };
 
 

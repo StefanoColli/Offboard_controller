@@ -50,7 +50,7 @@ double TrapezoidalVelocityProfile::compute_trajectory_velocity(double t)
 {
     if (t >= t_i && t <= t_i + t_acc)   // acceleration phase
     {
-        return (max_trajectory_speed / t_acc) * t;
+        return (max_trajectory_speed / t_acc) * (t - t_i);
     }
     else if (t < t_f - t_dec) // constant velocity phase
     { 
@@ -64,6 +64,31 @@ double TrapezoidalVelocityProfile::compute_trajectory_velocity(double t)
     {
         return 0.0;
     }
+}
+
+double TrapezoidalVelocityProfile::compute_trajectory_acceleration(double t)
+{
+    if (t >= t_i && t <= t_i + t_acc)   // acceleration phase
+    {
+        return max_trajectory_speed / t_acc;
+    }
+    else if (t < t_f - t_dec) // constant velocity phase
+    { 
+        return 0.0;
+    }
+    else if(t <= t_f) // deceleration phase
+    {
+        return max_trajectory_speed / t_dec;
+    }
+    else // outside [t_i, t_f]
+    {
+        return 0.0;
+    }
+}
+
+double TrapezoidalVelocityProfile::compute_trajectory_jerk(double t)
+{
+    return 0.0;
 }
 
 CubicTrajectory::CubicTrajectory(double starting_time, double ending_time, double starting_pos, double final_pos,
@@ -90,4 +115,14 @@ double CubicTrajectory::compute_trajectory_position(double t)
 double CubicTrajectory::compute_trajectory_velocity(double t)
 {
     return a_1 + 2*a_2*(t-t_i) + 3*a_3*pow((t-t_i),2);
+}
+
+double CubicTrajectory::compute_trajectory_acceleration(double t)
+{
+    return 2*a_2 + 6*a_3*(t-t_i);
+}
+
+double CubicTrajectory::compute_trajectory_jerk(double t)
+{
+    return 6*a_3;
 }

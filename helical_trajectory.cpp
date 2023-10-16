@@ -27,6 +27,8 @@
 using namespace mavsdk;
 using std::this_thread::sleep_for;
  
+enum control_type {PID, HOSM};
+
 /* Helical trajectory parameters 
  * The helix is a space curve with parametric equations (https://mathworld.wolfram.com/Helix.html):
  *      x =	r*cos(t)	         
@@ -46,7 +48,8 @@ constexpr double helix_duration = 50.0;                           //!< helical t
 
 // global variables
 uint64_t unix_epoch_time_us;                                       //!< onboard unix time [us]
-bool is_offboard = false;                                          //!< offboard flag
+bool is_offboard = false;                                          //!< offboard flag  
+control_type ctrl_mode = PID;                                      //!< control mode used in the drone                                      
 
 // ground station settings 
 bool logging = true;                                               //!< start/stop logging the position and position setpoint messages
@@ -193,7 +196,7 @@ void set_simulation_parameters(Param &param)
  * @param mode desired control mode (0 -> PID, 1 -> HOSM)
  * @param mavlinkpassthrough MavlinkPassthrough plugin instance
  */
-void switch_control_mode(uint8_t mode, MavlinkPassthrough &mavlinkpassthrough)
+void switch_control_mode(control_type mode, MavlinkPassthrough &mavlinkpassthrough)
 {
     mavlink_message_t message;
     mavlink_msg_control_type_pack(
@@ -201,6 +204,23 @@ void switch_control_mode(uint8_t mode, MavlinkPassthrough &mavlinkpassthrough)
         mavlinkpassthrough.get_our_compid(),
         &message,
         mode);
+    mavlinkpassthrough.send_message(message);
+    ctrl_mode = mode;
+}
+
+void send_trajectory_vector(float pos_stp[3], float vel_stp[3], float acc_stp[3], float jerk_stp[3],
+                                float psi, float psi_dot, MavlinkPassthrough &mavlinkpassthrough)
+{
+    mavlink_message_t message;
+    mavlink_msg_trajectory_vector_pack(
+        mavlinkpassthrough.get_our_sysid(),
+        mavlinkpassthrough.get_our_compid(),
+        &message,
+        pos_stp[0], vel_stp[0], acc_stp[0], jerk_stp[0],
+        pos_stp[1], vel_stp[1], acc_stp[1], jerk_stp[1],
+        pos_stp[2], vel_stp[2], acc_stp[2], jerk_stp[2],
+        psi, psi_dot
+    );
     mavlinkpassthrough.send_message(message);
 }
 
@@ -249,10 +269,10 @@ void takeoff(float height, Action &action, Telemetry &telemetry)
     }
 
     // float target_alt = action.get_takeoff_altitude();
-    float current_position = 0;
-    while (current_position < height)
+    float current_altitude = 0;
+    while (current_altitude < height)
     {
-        current_position = telemetry.position().relative_altitude_m;
+        current_altitude = telemetry.position().relative_altitude_m;
         sleep_for(std::chrono::seconds(1));
     }
     // Reached target altitude
@@ -309,6 +329,7 @@ void start_offboard_mode(Offboard &offboard)
     else
     {
         std::cout << "Switched to Offboard mode" << std::endl;
+        is_offboard = true;
     }
 }
 
@@ -328,6 +349,7 @@ void stop_offboard_mode(Offboard &offboard)
     else
     {
         std::cout << "Stopped Offboard mode, drone is in Hold mode" << std::endl;
+        is_offboard = false;
     }
 }
 
@@ -397,23 +419,39 @@ void offboard_goto(const Offboard::PositionNedYaw &target_pos, double duration, 
  * 
  * @param[out] target_pos output position setpoint
  * @param[out] target_vel output velocity setpoint
+ * @param[out] target_acc output acceleration setpoint
+ * @param[out] target_jerk output jerk setpoint
  * @param trajectory_gen TrajectoryGenerator instance used to smooth the trajectory
  * @param t time elapsed from the start of the helical motion [s] (t in [t_i, t_f])
  */
-void compute_helix_setpoint(Offboard::PositionNedYaw &target_pos, Offboard::VelocityNedYaw &target_vel, TrajectoryGenerator &trajectory_gen, double t)
+void compute_helix_setpoint(float target_pos[3], float target_vel[3], float target_acc[3], float target_jerk[3],
+                            TrajectoryGenerator &trajectory_gen, double t)
 {   
     // compute trajectory with a trapezoidal profile speed
     double q = trajectory_gen.compute_trajectory_position(t);
     double q_dot = trajectory_gen.compute_trajectory_velocity(t); 
+    double q_2dot = trajectory_gen.compute_trajectory_acceleration(t);
+    double q_3dot = trajectory_gen.compute_trajectory_jerk(t);
 
-    // compute position and velocity setpoints
-    target_pos.north_m = helix_origin[0] + helix_radius * cosf(q);
-    target_pos.east_m = helix_origin[1] + helix_radius * sinf(q);
-    target_pos.down_m = helix_origin[2] - c * q; // NED frame
+    // position setpoint
+    target_pos[0] = helix_origin[0] + helix_radius * cosf(q);
+    target_pos[1] = helix_origin[1] + helix_radius * sinf(q);
+    target_pos[2] = helix_origin[2] - c * q; // NED frame
 
-    target_vel.north_m_s = - helix_radius * q_dot * sinf(q);
-    target_vel.east_m_s = helix_radius * q_dot * cosf(q);
-    target_vel.down_m_s = - c * q_dot; // NED frame
+    // velocity setpoint
+    target_vel[0] = - helix_radius * sinf(q) * q_dot;
+    target_vel[1] = helix_radius * cosf(q) * q_dot;
+    target_vel[2] = - c * q_dot; // NED frame
+
+    // acceleration setpoint 
+    target_acc[0] = - helix_radius * cosf(q) * q_2dot;
+    target_acc[1] = - helix_radius * sinf(q) * q_2dot;
+    target_acc[2] = - c * q_2dot; // NED frame
+
+    // jerk setpoint
+    target_jerk[0] = helix_radius * sinf(q) * q_3dot; 
+    target_jerk[1] = - helix_radius * cosf(q) * q_3dot;
+    target_jerk[2] = - c * q_3dot; // NED frame
 }
 
 /** //TODO use download async
@@ -588,6 +626,65 @@ void subscribe_function(uint message_id, std::function<void (const mavlink_messa
     mavlinkpassthrough.unsubscribe_message(handle);
 }
 
+/**
+ * @brief Perform ascending helical trajectory
+ * 
+ * @param offboard Offboard plugin instance
+ * @param mavlinkpassthrough MavlinkPassthrough plugin instance
+ */
+void perform_helical_trajectory(Offboard &offboard, MavlinkPassthrough &mavlinkpassthrough)
+{
+    if (!is_offboard)
+    {
+        std::cout << "Drone is NOT in offboard mode" << std::endl;
+    }
+    else
+    {
+        uint64_t start_unix_time_us = unix_epoch_time_us;
+        Offboard::PositionNedYaw off_pos_stp;
+        Offboard::VelocityNedYaw off_vel_stp;
+        float pos_stp[3], vel_stp[3], acc_stp[3], jerk_stp[3];
+
+        // We describe a path for the parameter of the helical trajectory (parameter t in https://mathworld.wolfram.com/Helix.html)
+        //  having a trapezoidal velocity profile
+        TrapezoidalVelocityProfile trapezoidal_trajectory = TrapezoidalVelocityProfile(0.0, helix_duration, 0.0, N_loops*2*PI, max_trajectory_speed);
+
+        // start threads to log incoming messages
+        std::thread thread_pos(subscribe_function, MAVLINK_MSG_ID_LOCAL_POSITION_NED, position_callback, std::ref(mavlinkpassthrough));
+        std::thread thread_pos_stp(subscribe_function, MAVLINK_MSG_ID_POSITION_TARGET_LOCAL_NED, setpoint_callback, std::ref(mavlinkpassthrough));
+
+        std::cout << "Performing helical trajectory" << std::endl;
+        double trajectory_time = 0.0;
+        while (trajectory_time <= helix_duration)
+        {
+            trajectory_time = (unix_epoch_time_us - start_unix_time_us) / 1e6;
+
+            compute_helix_setpoint(pos_stp, vel_stp, acc_stp, jerk_stp, trapezoidal_trajectory,  trajectory_time);
+
+            send_trajectory_vector(pos_stp, vel_stp, acc_stp, jerk_stp, 0.0 , 0.0, mavlinkpassthrough);
+
+            off_pos_stp.north_m = pos_stp[0];
+            off_pos_stp.east_m = pos_stp[1];
+            off_pos_stp.down_m = pos_stp[2];
+
+            off_vel_stp.north_m_s = vel_stp[0];
+            off_vel_stp.east_m_s = vel_stp[1];
+            off_vel_stp.down_m_s = vel_stp[2];
+
+            offboard.set_position_velocity_ned(off_pos_stp, off_vel_stp);
+
+            sleep_for(std::chrono::milliseconds(20)); // send setpoints at 50Hz
+        }
+
+        logging = false;
+
+        // join logging threads
+        thread_pos.join();
+        thread_pos_stp.join();
+    }
+
+}
+
 int main(int argc, char **argv)
 {
     std::string system_url;
@@ -624,7 +721,7 @@ int main(int argc, char **argv)
     Param param = Param{system};
     MavlinkPassthrough mavlinkpassthrough = MavlinkPassthrough{system}; // to access the undelying mavlink protocol
 
-    // Time subscription
+    // subscriptions
     telemetry.set_rate_unix_epoch_time(50.0);
     Telemetry::UnixEpochTimeHandle unix_time_handle = telemetry.subscribe_unix_epoch_time(time_callback);
     
@@ -650,6 +747,7 @@ int main(int argc, char **argv)
                       << " - \'auto\' to perform the entire simulation;\n"
                       << " - \'close\' to terminate the ground control application;\n"
                       << " - \'csv\' to store the logged data as csv file;\n"
+                      << " - \'ctrlmode\' to switch the control mode to be used (PID or HOSM);\n"
                       << " - \'goto\' to reach target position;\n"
                       << " - \'helix\' to perform a helical ascending trajectory;\n"
                       << " - \'help\' to list all available commands;\n"
@@ -660,7 +758,7 @@ int main(int argc, char **argv)
                       << " - \'ulg\' to download the ulg log from the drone;\n"
                       << std::endl;
         }
-        else if (cmd == "close")
+        else if (cmd == "close" || cmd == "quit")
         {
             break;               
         }
@@ -699,18 +797,20 @@ int main(int argc, char **argv)
             // save logs to csv file
             log_to_csv(filename + ".csv");
         }
-        else if (cmd == "offmode")
+        else if (cmd == "ctrlmode")
         {
-            if(!is_offboard)
+            if (ctrl_mode == PID)
             {
-                start_offboard_mode(offboard);
-                is_offboard = true;
+                switch_control_mode(HOSM, mavlinkpassthrough);
             }
             else
             {
-                stop_offboard_mode(offboard);
-                is_offboard = false;
+                switch_control_mode(PID, mavlinkpassthrough);
             }
+        }
+        else if (cmd == "offmode")
+        {
+            is_offboard? stop_offboard_mode(offboard) : start_offboard_mode(offboard);
         }
         else if (cmd == "goto")
         {
@@ -733,43 +833,7 @@ int main(int argc, char **argv)
         }
         else if (cmd == "helix")
         {
-            if (!is_offboard)
-            {
-                std::cout << "Drone is NOT in offboard mode" << std::endl;
-            }
-            else
-            {
-                uint64_t start_unix_time_us = unix_epoch_time_us;
-                Offboard::PositionNedYaw pos_stp;
-                Offboard::VelocityNedYaw vel_stp;
-
-                // We describe a path for the parameter of the helical trajectory (parameter t in https://mathworld.wolfram.com/Helix.html)
-                //  having a trapezoidal velocity profile
-                TrapezoidalVelocityProfile trapezoidal_trajectory = TrapezoidalVelocityProfile(0.0, helix_duration, 0.0, N_loops*2*PI, max_trajectory_speed);
-
-                // start threads to log incoming messages
-                std::thread thread_pos(subscribe_function, MAVLINK_MSG_ID_LOCAL_POSITION_NED, position_callback, std::ref(mavlinkpassthrough));
-                std::thread thread_pos_stp(subscribe_function, MAVLINK_MSG_ID_POSITION_TARGET_LOCAL_NED, setpoint_callback, std::ref(mavlinkpassthrough));
-
-                std::cout << "Performing helical trajectory" << std::endl;
-                double trajectory_time = 0.0;
-                while (trajectory_time <= helix_duration)
-                {
-                    trajectory_time = (unix_epoch_time_us - start_unix_time_us) / 1e6;
-
-                    compute_helix_setpoint(pos_stp, vel_stp, trapezoidal_trajectory,  trajectory_time);
-                    offboard.set_position_velocity_ned(pos_stp, vel_stp);
-
-                    sleep_for(std::chrono::milliseconds(20)); // send setpoints at 50Hz
-                }
-
-                logging = false;
-
-                // join logging threads
-                thread_pos.join();
-                thread_pos_stp.join();
-            }
-
+            perform_helical_trajectory(offboard, mavlinkpassthrough);
         }
         else if (cmd == "auto")
         {
@@ -788,38 +852,13 @@ int main(int argc, char **argv)
             std::cout << "Approaching starting position" << std::endl;
             Offboard::PositionNedYaw target_position{helix_start[0], helix_start[1], helix_start[2], 0.0f};
             offboard_goto(target_position, 10.0, offboard, telemetry);
-
-            uint64_t start_unix_time_us = unix_epoch_time_us;
-            Offboard::PositionNedYaw pos_stp;
-            Offboard::VelocityNedYaw vel_stp;
-
-            // We describe a path for the parameter of the helical trajectory (parameter t in https://mathworld.wolfram.com/Helix.html)
-            //  having a trapezoidal velocity profile
-            TrapezoidalVelocityProfile trapezoidal_trajectory = TrapezoidalVelocityProfile(0.0, helix_duration, 0.0, N_loops*2*PI, max_trajectory_speed);
-
-            // start threads to log incoming messages
-            std::thread thread_pos(subscribe_function, MAVLINK_MSG_ID_LOCAL_POSITION_NED, position_callback, std::ref(mavlinkpassthrough));
-            std::thread thread_pos_stp(subscribe_function, MAVLINK_MSG_ID_POSITION_TARGET_LOCAL_NED, setpoint_callback, std::ref(mavlinkpassthrough));
-
-            std::cout << "Performing helical trajectory" << std::endl;
-            double trajectory_time = 0.0;
-            while (trajectory_time <= helix_duration)
-            {
-                trajectory_time = (unix_epoch_time_us - start_unix_time_us) / 1e6;
-
-                compute_helix_setpoint(pos_stp, vel_stp, trapezoidal_trajectory,  trajectory_time);
-                offboard.set_position_velocity_ned(pos_stp, vel_stp);
-
-                sleep_for(std::chrono::milliseconds(20)); // send setpoints at 50Hz
-            }
+            
+            // perform helical trajectory
+            perform_helical_trajectory(offboard, mavlinkpassthrough);
+            
             stop_offboard_mode(offboard);
-            logging = false;
-
+            
             land_and_disarm(action, telemetry);
-
-            // join logging threads
-            thread_pos.join();
-            thread_pos_stp.join();
 
             // save logs to csv file
             log_to_csv();
